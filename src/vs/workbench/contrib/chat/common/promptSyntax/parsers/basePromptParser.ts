@@ -4,6 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { localize } from '../../../../../../nls.js';
+import { PROMPT_FILE_EXTENSION } from '../constants.js';
 import { URI } from '../../../../../../base/common/uri.js';
 import { ChatPromptCodec } from '../codecs/chatPromptCodec.js';
 import { Emitter } from '../../../../../../base/common/event.js';
@@ -20,9 +21,7 @@ import { basename, extUri } from '../../../../../../base/common/resources.js';
 import { VSBufferReadableStream } from '../../../../../../base/common/buffer.js';
 import { ObservableDisposable } from '../../../../../../base/common/observableDisposable.js';
 import { FilePromptContentProvider } from '../contentProviders/filePromptContentsProvider.js';
-import { PROMP_SNIPPET_FILE_EXTENSION } from '../contentProviders/promptContentsProviderBase.js';
 import { IInstantiationService } from '../../../../../../platform/instantiation/common/instantiation.js';
-import { IConfigurationService } from '../../../../../../platform/configuration/common/configuration.js';
 import { MarkdownLink } from '../../../../../../editor/common/codecs/markdownCodec/tokens/markdownLink.js';
 import { FileOpenFailed, NonPromptSnippetFile, RecursiveReference, ParseError, FailedToResolveContentsStream } from '../../promptFileReferenceErrors.js';
 
@@ -40,11 +39,6 @@ const errorMessages = {
  * Error conditions that may happen during the file reference resolution.
  */
 export type TErrorCondition = FileOpenFailed | RecursiveReference | NonPromptSnippetFile;
-
-/**
- * Configuration key for the prompt snippets feature.
- */
-const PROMPT_SNIPPETS_CONFIG_KEY: string = 'chat.experimental.prompt-snippets';
 
 /**
  * Base prompt parser class that provides a common interface for all
@@ -134,12 +128,12 @@ export abstract class BasePromptParser<T extends IPromptContentsProvider> extend
 	 * Same as {@linkcode settled} but also waits for all possible
 	 * nested child prompt references and their children to be settled.
 	 */
-	public async settledAll(): Promise<this> {
+	public async allSettled(): Promise<this> {
 		await this.settled();
 
 		await Promise.allSettled(
 			this.references.map((reference) => {
-				return reference.settledAll();
+				return reference.allSettled();
 			}),
 		);
 
@@ -150,7 +144,6 @@ export abstract class BasePromptParser<T extends IPromptContentsProvider> extend
 		private readonly promptContentsProvider: T,
 		seenReferences: string[] = [],
 		@IInstantiationService protected readonly instantiationService: IInstantiationService,
-		@IConfigurationService protected readonly configService: IConfigurationService,
 		@ILogService protected readonly logService: ILogService,
 	) {
 		super();
@@ -178,7 +171,7 @@ export abstract class BasePromptParser<T extends IPromptContentsProvider> extend
 
 		this._register(
 			this.promptContentsProvider.onContentChanged((streamOrError) => {
-				// process the the received message
+				// process the received message
 				this.onContentsChanged(streamOrError, seenReferences);
 
 				// indicate that we've received at least one `onContentChanged` event
@@ -350,26 +343,6 @@ export abstract class BasePromptParser<T extends IPromptContentsProvider> extend
 	}
 
 	/**
-	 * Check if the prompt snippets feature is enabled.
-	 * @see {@link PROMPT_SNIPPETS_CONFIG_KEY}
-	 */
-	public static promptSnippetsEnabled(
-		configService: IConfigurationService,
-	): boolean {
-		const value = configService.getValue(PROMPT_SNIPPETS_CONFIG_KEY);
-
-		if (!value) {
-			return false;
-		}
-
-		if (typeof value === 'string') {
-			return value.trim().toLowerCase() === 'true';
-		}
-
-		return !!value;
-	}
-
-	/**
 	 * Get a list of immediate child references of the prompt.
 	 */
 	public get references(): readonly IPromptFileReference[] {
@@ -494,12 +467,14 @@ export abstract class BasePromptParser<T extends IPromptContentsProvider> extend
 	/**
 	 * Get message for the provided error condition object.
 	 *
-	 * @param error Error object.
+	 * @param error Error object that extends {@link ParseError}.
 	 * @returns Error message.
 	 */
-	protected getErrorMessage(error: ParseError): string {
-		// if failed to resolve prompt contents stream, return
-		// the approprivate message and the prompt path
+	protected getErrorMessage<TError extends ParseError>(error: TError): string {
+		if (error instanceof FileOpenFailed) {
+			return `${errorMessages.fileOpenFailed} '${error.uri.path}'.`;
+		}
+
 		if (error instanceof FailedToResolveContentsStream) {
 			return `${errorMessages.streamOpenFailed} '${error.uri.path}'.`;
 		}
@@ -532,7 +507,7 @@ export abstract class BasePromptParser<T extends IPromptContentsProvider> extend
 	 * Check if the provided URI points to a prompt snippet.
 	 */
 	public static isPromptSnippet(uri: URI): boolean {
-		return uri.path.endsWith(PROMP_SNIPPET_FILE_EXTENSION);
+		return uri.path.endsWith(PROMPT_FILE_EXTENSION);
 	}
 
 	/**
@@ -582,13 +557,12 @@ export class PromptFileReference extends BasePromptParser<FilePromptContentProvi
 		dirname: URI,
 		seenReferences: string[] = [],
 		@IInstantiationService initService: IInstantiationService,
-		@IConfigurationService configService: IConfigurationService,
 		@ILogService logService: ILogService,
 	) {
 		const fileUri = extUri.resolvePath(dirname, token.path);
 		const provider = initService.createInstance(FilePromptContentProvider, fileUri);
 
-		super(provider, seenReferences, initService, configService, logService);
+		super(provider, seenReferences, initService, logService);
 	}
 
 	/**

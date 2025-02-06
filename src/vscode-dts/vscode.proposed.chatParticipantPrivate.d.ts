@@ -3,7 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-// version: 2
+// version: 3
 
 declare module 'vscode' {
 
@@ -121,5 +121,29 @@ declare module 'vscode' {
 
 	export interface LanguageModelToolInvocationOptions<T> {
 		chatRequestId?: string;
+	}
+
+	export interface PreparedToolInvocation {
+		pastTenseMessage?: string | MarkdownString;
+		tooltip?: string | MarkdownString;
+	}
+
+	export interface ChatParticipantMetadata {
+		participant: string;
+		command?: string;
+		disambiguation: { category: string; description: string; examples: string[] }[];
+	}
+
+	export interface ChatParticipantDetectionResult {
+		participant: string;
+		command?: string;
+	}
+
+	export interface ChatParticipantDetectionProvider {
+		provideParticipantDetection(chatRequest: ChatRequest, context: ChatContext, options: { participants?: ChatParticipantMetadata[]; location: ChatLocation }, token: CancellationToken): ProviderResult<ChatParticipantDetectionResult>;
+	}
+
+	export namespace chat {
+		export function registerChatParticipantDetectionProvider(participantDetectionProvider: ChatParticipantDetectionProvider): Disposable;
 	}
 }
