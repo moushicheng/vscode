@@ -3,10 +3,12 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-
 import { reset } from '../../../../base/browser/dom.js';
 import { IActionViewItemProvider } from '../../../../base/browser/ui/actionbar/actionbar.js';
+import { IActionViewItemOptions } from '../../../../base/browser/ui/actionbar/actionViewItems.js';
 import { renderLabelWithIcons } from '../../../../base/browser/ui/iconLabel/iconLabels.js';
+import { IAction } from '../../../../base/common/actions.js';
+import { Emitter, Event } from '../../../../base/common/event.js';
 import { Disposable } from '../../../../base/common/lifecycle.js';
 import { autorun, derived, IObservable, observableFromEvent } from '../../../../base/common/observable.js';
 import { assertType } from '../../../../base/common/types.js';
@@ -38,7 +40,9 @@ export class ChatSelectedTools extends Disposable {
 
 	readonly tools: IObservable<IToolData[]>;
 
-	readonly toolsActionItemViewItemProvider: IActionViewItemProvider;
+	readonly toolsActionItemViewItemProvider: IActionViewItemProvider & { onDidRender: Event<void> };
+
+	private allTools: IObservable<Readonly<IToolData>[]>;
 
 	constructor(
 		@ILanguageModelToolsService toolsService: ILanguageModelToolsService,
@@ -49,9 +53,9 @@ export class ChatSelectedTools extends Disposable {
 
 		this._selectedTools = this._register(storedTools(StorageScope.WORKSPACE, StorageTarget.MACHINE, storageService));
 
-		const allTools = observableFromEvent(
+		this.allTools = observableFromEvent(
 			toolsService.onDidChangeTools,
-			() => Array.from(toolsService.getTools()).filter(t => t.canBeReferencedInPrompt)
+			() => Array.from(toolsService.getTools()).filter(t => t.supportsToolPicker)
 		);
 
 		const disabledData = this._selectedTools.map(data => {
@@ -63,7 +67,7 @@ export class ChatSelectedTools extends Disposable {
 
 		this.tools = derived(r => {
 			const disabled = disabledData.read(r);
-			const tools = allTools.read(r);
+			const tools = this.allTools.read(r);
 			if (!disabled) {
 				return tools;
 			}
@@ -74,46 +78,70 @@ export class ChatSelectedTools extends Disposable {
 		});
 
 		const toolsCount = derived(r => {
-			const count = allTools.read(r).length;
+			const count = this.allTools.read(r).length;
 			const enabled = this.tools.read(r).length;
 			return { count, enabled };
 		});
 
-		this.toolsActionItemViewItemProvider = (action, options) => {
-			if (!(action instanceof MenuItemAction)) {
-				return undefined;
-			}
+		const onDidRender = this._store.add(new Emitter<void>());
 
-			return instaService.createInstance(class extends MenuEntryActionViewItem {
-
-				override render(container: HTMLElement): void {
-					this.options.icon = false;
-					this.options.label = true;
-					container.classList.add('chat-mcp');
-					super.render(container);
+		this.toolsActionItemViewItemProvider = Object.assign(
+			(action: IAction, options: IActionViewItemOptions) => {
+				if (!(action instanceof MenuItemAction)) {
+					return undefined;
 				}
 
-				protected override updateLabel(): void {
-					this._store.add(autorun(r => {
-						assertType(this.label);
+				return instaService.createInstance(class extends MenuEntryActionViewItem {
 
-						const { enabled, count } = toolsCount.read(r);
+					override render(container: HTMLElement): void {
+						this.options.icon = false;
+						this.options.label = true;
+						container.classList.add('chat-mcp', 'chat-attachment-button');
+						super.render(container);
+					}
 
-						if (count === 0) {
-							super.updateLabel();
-							return;
-						}
+					protected override updateLabel(): void {
+						this._store.add(autorun(r => {
+							assertType(this.label);
 
-						const message = enabled !== count
-							? localize('tool.1', "{0} {1} of {2}", '$(tools)', enabled, count)
-							: localize('tool.0', "{0} {1}", '$(tools)', count);
-						reset(this.label, ...renderLabelWithIcons(message));
-					}));
-				}
+							const { enabled, count } = toolsCount.read(r);
 
-			}, action, { ...options, keybindingNotRenderedWithLabel: true });
+							const message = count === 0
+								? '$(tools)'
+								: enabled !== count
+									? localize('tool.1', "{0} {1} of {2}", '$(tools)', enabled, count)
+									: localize('tool.0', "{0} {1}", '$(tools)', count);
 
-		};
+							reset(this.label, ...renderLabelWithIcons(message));
+
+							if (this.element?.isConnected) {
+								onDidRender.fire();
+							}
+						}));
+					}
+
+				}, action, { ...options, keybindingNotRenderedWithLabel: true });
+			},
+			{ onDidRender: onDidRender.event }
+		);
+	}
+
+	/**
+	 * Select only the provided tools unselecting the rest.
+	 *
+	 * @param tools Set of tool IDs to select.
+	 */
+	public selectOnly(
+		tools: readonly string[],
+	): void {
+		const allTools = this.allTools.get();
+		const uniqueTools = new Set(tools);
+
+		const disabledTools = allTools.filter((tool) => {
+			return (uniqueTools.has(tool.id) === false);
+		});
+
+		this.update([], disabledTools);
 	}
 
 	update(disableBuckets: readonly ToolDataSource[], disableTools: readonly IToolData[]): void {

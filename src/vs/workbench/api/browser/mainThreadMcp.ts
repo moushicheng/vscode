@@ -9,18 +9,20 @@ import { Disposable, DisposableMap } from '../../../base/common/lifecycle.js';
 import { ISettableObservable, observableValue } from '../../../base/common/observable.js';
 import { LogLevel } from '../../../platform/log/common/log.js';
 import { IMcpMessageTransport, IMcpRegistry } from '../../contrib/mcp/common/mcpRegistryTypes.js';
-import { McpCollectionDefinition, McpConnectionState, McpServerDefinition, McpServerTransportType } from '../../contrib/mcp/common/mcpTypes.js';
+import { McpCollectionDefinition, McpConnectionState, McpServerDefinition, McpServerLaunch, McpServerTransportType } from '../../contrib/mcp/common/mcpTypes.js';
 import { MCP } from '../../contrib/mcp/common/modelContextProtocol.js';
 import { ExtensionHostKind, extensionHostKindToString } from '../../services/extensions/common/extensionHostKind.js';
 import { IExtHostContext, extHostNamedCustomer } from '../../services/extensions/common/extHostCustomers.js';
-import { ExtHostContext, MainContext, MainThreadMcpShape } from '../common/extHost.protocol.js';
+import { Proxied } from '../../services/extensions/common/proxyIdentifier.js';
+import { ExtHostContext, ExtHostMcpShape, MainContext, MainThreadMcpShape } from '../common/extHost.protocol.js';
 
 @extHostNamedCustomer(MainContext.MainThreadMcp)
 export class MainThreadMcp extends Disposable implements MainThreadMcpShape {
 
 	private _serverIdCounter = 0;
 
-	private readonly _servers = this._register(new DisposableMap<number, ExtHostMcpServerLaunch>());
+	private readonly _servers = new Map<number, ExtHostMcpServerLaunch>();
+	private readonly _proxy: Proxied<ExtHostMcpShape>;
 	private readonly _collectionDefinitions = this._register(new DisposableMap<string, {
 		fromExtHost: McpCollectionDefinition.FromExtHost;
 		servers: ISettableObservable<readonly McpServerDefinition[]>;
@@ -32,13 +34,14 @@ export class MainThreadMcp extends Disposable implements MainThreadMcpShape {
 		@IMcpRegistry private readonly _mcpRegistry: IMcpRegistry,
 	) {
 		super();
-		const proxy = _extHostContext.getProxy(ExtHostContext.ExtHostMcp);
+		const proxy = this._proxy = _extHostContext.getProxy(ExtHostContext.ExtHostMcp);
 		this._register(this._mcpRegistry.registerDelegate({
+			// Prefer Node.js extension hosts when they're available. No CORS issues etc.
+			priority: _extHostContext.extensionHostKind === ExtensionHostKind.LocalWebWorker ? 0 : 1,
 			waitForInitialProviderPromises() {
 				return proxy.$waitForInitialCollectionProviders();
 			},
 			canStart(collection, serverDefinition) {
-				// todo: SSE MPC servers without a remote authority could be served from the renderer
 				if (collection.remoteAuthority !== _extHostContext.remoteAuthority) {
 					return false;
 				}
@@ -72,6 +75,10 @@ export class MainThreadMcp extends Disposable implements MainThreadMcpShape {
 			const serverDefinitions = observableValue<readonly McpServerDefinition[]>('mcpServers', servers);
 			const handle = this._mcpRegistry.registerCollection({
 				...collection,
+				resolveServerLanch: collection.canResolveLaunch ? (async def => {
+					const r = await this._proxy.$resolveMcpLaunch(collection.id, def.label);
+					return r ? McpServerLaunch.fromSerialized(r) : undefined;
+				}) : undefined,
 				remoteAuthority: this._extHostContext.remoteAuthority,
 				serverDefinitions,
 			});
@@ -89,10 +96,15 @@ export class MainThreadMcp extends Disposable implements MainThreadMcpShape {
 	}
 
 	$onDidChangeState(id: number, update: McpConnectionState): void {
-		this._servers.get(id)?.state.set(update, undefined);
+		const server = this._servers.get(id);
+		if (!server) {
+			return;
+		}
 
+		server.state.set(update, undefined);
 		if (!McpConnectionState.isRunning(update)) {
-			this._servers.deleteAndDispose(id);
+			server.dispose();
+			this._servers.delete(id);
 		}
 	}
 
@@ -107,6 +119,14 @@ export class MainThreadMcp extends Disposable implements MainThreadMcpShape {
 
 	$onDidReceiveMessage(id: number, message: string): void {
 		this._servers.get(id)?.pushMessage(message);
+	}
+
+	override dispose(): void {
+		for (const server of this._servers.values()) {
+			server.extHostDispose();
+		}
+		this._servers.clear();
+		super.dispose();
 	}
 }
 
@@ -133,7 +153,11 @@ class ExtHostMcpServerLaunch extends Disposable implements IMcpMessageTransport 
 		}
 
 		if (parsed) {
-			this._onDidReceiveMessage.fire(parsed);
+			if (Array.isArray(parsed)) { // streamable HTTP supports batching
+				parsed.forEach(p => this._onDidReceiveMessage.fire(p));
+			} else {
+				this._onDidReceiveMessage.fire(parsed);
+			}
 		}
 	}
 
@@ -149,10 +173,17 @@ class ExtHostMcpServerLaunch extends Disposable implements IMcpMessageTransport 
 		}));
 	}
 
-	public override dispose(): void {
+	public extHostDispose() {
 		if (McpConnectionState.isRunning(this.state.get())) {
 			this.pushLog(LogLevel.Warning, 'Extension host shut down, server will stop.');
 			this.state.set({ state: McpConnectionState.Kind.Stopped }, undefined);
+		}
+		this.dispose();
+	}
+
+	public override dispose(): void {
+		if (McpConnectionState.isRunning(this.state.get())) {
+			this.stop();
 		}
 
 		super.dispose();
