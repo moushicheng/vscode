@@ -45,6 +45,7 @@ import { CodeBlockPart, ICodeBlockData, ICodeBlockRenderOptions, localFileLangua
 import '../media/chatCodeBlockPill.css';
 import { IDisposableReference, ResourcePool } from './chatCollections.js';
 import { IChatContentPart, IChatContentPartRenderContext } from './chatContentParts.js';
+import { ChatExtensionsContentPart } from './chatExtensionsContentPart.js';
 
 const $ = dom.$;
 
@@ -89,6 +90,13 @@ export class ChatMarkdownContentPart extends Disposable implements IChatContentP
 		// and within this part to find it within the codeblocks array
 		let globalCodeBlockIndexStart = codeBlockStartIndex;
 		let thisPartCodeBlockIndexStart = 0;
+
+		// Don't set to 'false' for responses, respect defaults
+		const markedOpts = isRequestVM(element) ? {
+			gfm: true,
+			breaks: true,
+		} : undefined;
+
 		const result = this._register(renderer.render(markdown.content, {
 			fillInIncompleteTokens,
 			codeBlockRendererSync: (languageId, text, raw) => {
@@ -97,6 +105,11 @@ export class ChatMarkdownContentPart extends Disposable implements IChatContentP
 					const hideEmptyCodeblock = $('div');
 					hideEmptyCodeblock.style.display = 'none';
 					return hideEmptyCodeblock;
+				}
+				if (languageId === 'vscode-extensions') {
+					const chatExtensions = this._register(instantiationService.createInstance(ChatExtensionsContentPart, { kind: 'extensions', extensions: text.split(',') }));
+					this._register(chatExtensions.onDidChangeHeight(() => this._onDidChangeHeight.fire()));
+					return chatExtensions.domNode;
 				}
 				const globalIndex = globalCodeBlockIndexStart++;
 				const thisPartIndex = thisPartCodeBlockIndexStart++;
@@ -128,7 +141,7 @@ export class ChatMarkdownContentPart extends Disposable implements IChatContentP
 				if (hideToolbar !== undefined) {
 					renderOptions.hideToolbar = hideToolbar;
 				}
-				const codeBlockInfo: ICodeBlockData = { languageId, textModel, codeBlockIndex: globalIndex, codeBlockPartIndex: thisPartIndex, element, range, parentContextKeyService: contextKeyService, vulns, codemapperUri: codeblockEntry?.codemapperUri, renderOptions };
+				const codeBlockInfo: ICodeBlockData = { languageId, textModel, codeBlockIndex: globalIndex, codeBlockPartIndex: thisPartIndex, element, range, parentContextKeyService: contextKeyService, vulns, codemapperUri: codeblockEntry?.codemapperUri, renderOptions, chatSessionId: element.sessionId };
 
 				if (element.isCompleteAddedRequest || !codeblockEntry?.codemapperUri || !codeblockEntry.isEdit) {
 					const ref = this.renderCodeBlock(codeBlockInfo, text, isCodeBlockComplete, currentWidth);
@@ -144,6 +157,7 @@ export class ChatMarkdownContentPart extends Disposable implements IChatContentP
 						readonly codeBlockIndex = globalIndex;
 						readonly elementId = element.id;
 						readonly isStreaming = false;
+						readonly chatSessionId = element.sessionId;
 						codemapperUri = undefined; // will be set async
 						public get uri() {
 							// here we must do a getter because the ref.object is rendered
@@ -177,6 +191,7 @@ export class ChatMarkdownContentPart extends Disposable implements IChatContentP
 						readonly elementId = element.id;
 						readonly isStreaming = !isCodeBlockComplete;
 						readonly codemapperUri = codeblockEntry?.codemapperUri;
+						readonly chatSessionId = element.sessionId;
 						public get uri() {
 							return undefined;
 						}
@@ -191,10 +206,7 @@ export class ChatMarkdownContentPart extends Disposable implements IChatContentP
 				}
 			},
 			asyncRenderCallback: () => this._onDidChangeHeight.fire(),
-		}, {
-			gfm: isRequestVM(element),
-			breaks: isRequestVM(element),
-		}));
+		}, markedOpts));
 
 		const markdownDecorationsRenderer = instantiationService.createInstance(ChatMarkdownDecorationsRenderer);
 		this._register(markdownDecorationsRenderer.walkTreeAndAnnotateReferenceLinks(markdown, result.element));
@@ -326,16 +338,13 @@ class CollapsedCodeBlock extends Disposable {
 	) {
 		super();
 		this.element = $('.chat-codeblock-pill-widget');
+		this.element.tabIndex = 0;
 		this.element.classList.add('show-file-icons');
-		this._register(dom.addDisposableListener(this.element, 'click', async () => {
-			if (this._currentDiff) {
-				this.editorService.openEditor({
-					original: { resource: this._currentDiff.originalURI },
-					modified: { resource: this._currentDiff.modifiedURI },
-					options: { transient: true },
-				});
-			} else if (this.uri) {
-				this.editorService.openEditor({ resource: this.uri });
+		this.element.role = 'button';
+		this._register(dom.addDisposableListener(this.element, 'click', () => this._showDiff()));
+		this._register(dom.addDisposableListener(this.element, 'keydown', (e) => {
+			if (e.key === 'Enter' || e.key === ' ') {
+				this._showDiff();
 			}
 		}));
 		this._register(dom.addDisposableListener(this.element, dom.EventType.CONTEXT_MENU, domEvent => {
@@ -351,6 +360,18 @@ class CollapsedCodeBlock extends Disposable {
 				},
 			});
 		}));
+	}
+
+	private _showDiff(): void {
+		if (this._currentDiff) {
+			this.editorService.openEditor({
+				original: { resource: this._currentDiff.originalURI },
+				modified: { resource: this._currentDiff.modifiedURI },
+				options: { transient: true },
+			});
+		} else if (this.uri) {
+			this.editorService.openEditor({ resource: this.uri });
+		}
 	}
 
 	render(uri: URI, isStreaming?: boolean): void {
@@ -382,7 +403,7 @@ class CollapsedCodeBlock extends Disposable {
 		const labelDetail = dom.$('span.label-detail', {}, '');
 		children.push(labelDetail);
 		if (isStreaming) {
-			labelDetail.textContent = localize('chat.codeblock.generating', "Generating Edits...");
+			labelDetail.textContent = localize('chat.codeblock.generating', "Generating edits...");
 		}
 
 		this.element.replaceChildren(iconEl, ...children);
@@ -414,12 +435,13 @@ class CollapsedCodeBlock extends Disposable {
 			}
 
 			modifiedByResponse = modifiedEntry?.isCurrentlyBeingModifiedBy.read(r);
-			const isComplete = !modifiedByResponse || modifiedByResponse.requestId !== this.requestId;
+			let diffValue = diffBetweenStops?.read(r);
+			const isComplete = !!diffValue || !modifiedByResponse || modifiedByResponse.requestId !== this.requestId;
 			const rewriteRatio = modifiedEntry?.rewriteRatio.read(r);
 
 			if (!isStreaming && !isComplete) {
 				const value = rewriteRatio;
-				labelDetail.textContent = value === 0 || !value ? localize('chat.codeblock.generating', "Generating Edits...") : localize('chat.codeblock.applyingPercentage', "Applying Edits ({0}%)...", Math.round(value * 100));
+				labelDetail.textContent = value === 0 || !value ? localize('chat.codeblock.generating', "Generating edits...") : localize('chat.codeblock.applyingPercentage', "Applying edits ({0}%)...", Math.round(value * 100));
 			} else if (!isStreaming && isComplete) {
 				iconEl.classList.remove(...iconClasses);
 				const fileKind = uri.path.endsWith('/') ? FileKind.FOLDER : FileKind.FILE;
@@ -431,10 +453,11 @@ class CollapsedCodeBlock extends Disposable {
 				diffBetweenStops = modifiedEntry && editSession
 					? editSession.getEntryDiffBetweenStops(modifiedEntry.modifiedURI, this.requestId, this.inUndoStop)
 					: undefined;
+				diffValue = diffBetweenStops?.read(r);
 			}
 
-			if (!isStreaming && isComplete && diffBetweenStops) {
-				renderDiff(diffBetweenStops.read(r));
+			if (!isStreaming && isComplete) {
+				renderDiff(diffValue);
 			}
 		}));
 	}
