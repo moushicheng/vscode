@@ -586,9 +586,17 @@ abstract class AbstractCloseAllAction extends Action2 {
 
 		for (const { editor, groupId } of editorService.getEditors(EditorsOrder.SEQUENTIAL, { excludeSticky: this.excludeSticky })) {
 			let confirmClose = false;
+			let handlerDidError = false;
 			if (editor.closeHandler) {
-				confirmClose = editor.closeHandler.showConfirm(); // custom handling of confirmation on close
-			} else {
+				try {
+					confirmClose = editor.closeHandler.showConfirm(); // custom handling of confirmation on close
+				} catch (error) {
+					logService.error(error);
+					handlerDidError = true;
+				}
+			}
+
+			if (!editor.closeHandler || handlerDidError) {
 				confirmClose = editor.isDirty() && !editor.isSaving(); // default confirm only when dirty and not saving
 			}
 
@@ -1170,7 +1178,10 @@ export class ToggleMaximizeEditorGroupAction extends Action2 {
 				when: EditorPartMaximizedEditorGroupContext
 			}],
 			icon: Codicon.screenFull,
-			toggled: EditorPartMaximizedEditorGroupContext,
+			toggled: {
+				condition: EditorPartMaximizedEditorGroupContext,
+				title: localize('unmaximizeGroup', "Unmaximize Group")
+			},
 		});
 	}
 
